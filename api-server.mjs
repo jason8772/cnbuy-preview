@@ -307,6 +307,24 @@ function applyEstimatedWeights(product, fallbackKg, options = {}) {
   return { ...clone2, ...estimated, ...variants ? { variants } : {} };
 }
 
+// server/search-language.ts
+var polishCategories = { "bluza": "hoodie", "bluzy": "hoodie", "bluza z kapturem": "hoodie", "buty": "shoes", "buty sportowe": "sneakers", "kurtka": "jacket", "kurtki": "jacket", "koszulka": "t-shirt", "koszulki": "t-shirt", "spodnie": "pants", "sukienka": "dress", "sukienki": "dress", "torebka": "handbag", "torebki": "handbag", "plecak": "backpack", "zegarek": "watch", "zegarki": "watch", "s\u0142uchawki": "headphones", "skarpetki": "socks", "czapka": "hat" };
+function queryPlan(query, language) {
+  const original = query.normalize("NFKC").trim().replace(/\s+/g, " ");
+  if (new RegExp("\\p{Script=Han}", "u").test(original)) return { original, submitted: original, providerLanguage: "zh", strategy: "native" };
+  if (language === "pl") {
+    const mapped = polishCategories[original.toLocaleLowerCase("pl")];
+    return mapped ? { original, submitted: mapped, providerLanguage: "en", strategy: "category_mapping", notice: `Wyszukiwanie dostawcy: ${mapped}.` } : { original, submitted: original, providerLanguage: "en", strategy: "original_with_english_output", notice: "Dostawca nie potwierdza pe\u0142nej obs\u0142ugi polskich zapyta\u0144. Je\u015Bli wyniki nie pasuj\u0105, u\u017Cyj angielskiego s\u0142owa." };
+  }
+  return { original, submitted: original, providerLanguage: language === "ru" || new RegExp("\\p{Script=Cyrillic}", "u").test(original) ? "ru" : "en", strategy: "native" };
+}
+function detailLanguage(language) {
+  return language === "ru" ? "ru" : language === "pl" || language === "en" ? "en" : "zh";
+}
+function catalogLanguage(value) {
+  return value && ["ru", "en", "zh-CN", "zh-TW", "pl"].includes(value) ? value : void 0;
+}
+
 // server/catalog.ts
 function object(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -457,6 +475,7 @@ var Cache = class {
 function createCatalogService(config, transport = fetch, now = Date.now) {
   const searchCache = new Cache(config.maxCacheEntries, now);
   const detailCache = new Cache(config.maxCacheEntries, now);
+  const descriptionCache = new Cache(config.maxCacheEntries, now);
   const titles = new Cache(config.maxCacheEntries * 20, now);
   const inFlight = /* @__PURE__ */ new Map();
   let hour = -1, day = -1, hourUsed = 0, dayUsed = 0;
@@ -533,11 +552,12 @@ function createCatalogService(config, transport = fetch, now = Date.now) {
     }
   }
   return {
-    async search(query, page) {
-      const result = await cached(`search:${page}:${query.toLocaleLowerCase("en")}`, searchCache, 15 * 6e4, async () => {
+    async search(query, page, language) {
+      const plan = queryPlan(query, language);
+      const result = await cached(`search:${plan.providerLanguage}:${page}:${plan.submitted.toLocaleLowerCase("en")}`, searchCache, 15 * 6e4, async () => {
         reserve(1);
-        const english = !/[\p{Script=Han}]/u.test(query);
-        const payload = await provider(english ? "global/search/items" : "search/items", { keyword: query, page: String(page), page_size: "20", ...english ? { language: "en" } : {} });
+        const global = plan.providerLanguage !== "zh";
+        const payload = await provider(global ? "global/search/items" : "search/items", { keyword: plan.submitted, page: String(page), page_size: "20", ...global ? { language: plan.providerLanguage } : {} });
         const data = object(object(payload)?.data);
         if (!Array.isArray(data?.items)) throw new ApiError(502, "CATALOG_INVALID_RESPONSE", "The supplier returned an incomplete search result. Please try again.");
         const fetchedAt = new Date(now()).toISOString();
@@ -553,21 +573,29 @@ function createCatalogService(config, transport = fetch, now = Date.now) {
           }
         }
         if (data.items.length && !products.length) throw new ApiError(502, "CATALOG_INVALID_RESPONSE", "The supplier returned incomplete search products. Please try again.");
-        return { products, page, hasMore: page < 10 && data.has_next_page === true, fetchedAt };
+        return { products, page, hasMore: page < 10 && data.has_next_page === true, fetchedAt, queryInfo: plan };
       });
-      return { ...result.value, cached: result.cached };
+      return { ...result.value, queryInfo: plan, cached: result.cached };
     },
-    async detail(id2, refresh = false) {
-      if (refresh) detailCache.invalidate(`detail:${id2}`);
-      const result = await cached(`detail:${id2}`, detailCache, 30 * 6e4, async () => {
-        reserve(2);
+    async detail(id2, refresh = false, language) {
+      const outputLanguage = detailLanguage(language);
+      const cacheKey = `detail:${outputLanguage}:${id2}`;
+      if (refresh) detailCache.invalidate(cacheKey);
+      const result = await cached(cacheKey, detailCache, 30 * 6e4, async () => {
+        const descriptionKey = `description:${id2}`;
+        const existingImages = descriptionCache.get(descriptionKey);
+        reserve(existingImages !== void 0 || inFlight.has(descriptionKey) ? 1 : 2);
         const sourceId = id2.slice(5);
-        const [detail, description] = await Promise.all([
-          provider("item_detail", { item_id: sourceId, language: "zh" }),
-          provider("item_desc", { item_id: sourceId })
+        const images2 = existingImages !== void 0 ? Promise.resolve(existingImages) : cached(descriptionKey, descriptionCache, 30 * 6e4, async () => {
+          const data = await provider("item_desc", { item_id: sourceId });
+          const result2 = tmapiDescriptionImages(data, sourceId);
+          if (result2 === null) throw new ApiError(502, "CATALOG_INVALID_RESPONSE", "The supplier returned incomplete product images. Please try again.");
+          return result2;
+        }).then((result2) => result2.value);
+        const [detail, detailImages] = await Promise.all([
+          provider("item_detail", { item_id: sourceId, language: outputLanguage }),
+          images2
         ]);
-        const detailImages = tmapiDescriptionImages(description, sourceId);
-        if (detailImages === null) throw new ApiError(502, "CATALOG_INVALID_RESPONSE", "The supplier returned incomplete product images. Please try again.");
         const normalized = normalizeTmapiProduct(detail, { sourceId, sourceTitle: titles.get(id2), detailImages, fetchedAt: new Date(now()).toISOString() });
         const product = normalized && sanitizeProduct(applyEstimatedWeights({ ...normalized, detailsLoaded: true }, void 0, { refreshEstimated: true }), config.apiKey);
         if (!product) throw new ApiError(502, "CATALOG_INVALID_RESPONSE", "The supplier returned incomplete product details. Please try again.");
@@ -609,6 +637,8 @@ function createApiServer(config, dependencies = {}) {
     try {
       if (req.method !== "GET") throw new ApiError(405, "METHOD_NOT_ALLOWED", "Only GET requests are supported.");
       const url = new URL(req.url ?? "/", "http://localhost");
+      const langValue = url.searchParams.get("lang"), language = catalogLanguage(langValue);
+      if (langValue && !language) throw new ApiError(400, "INVALID_LANGUAGE", "Unsupported catalog language.");
       if (url.pathname === "/health") {
         respond(res, 200, { status: "ok", catalogConfigured: Boolean(config.apiKey) });
         return;
@@ -626,13 +656,13 @@ function createApiServer(config, dependencies = {}) {
         const pageValue = url.searchParams.get("page") ?? "1";
         if (!query || [...query].length > 100 || /[\x00-\x1f\x7f<>]/.test(query) || !/^(?:[1-9]|10)$/.test(pageValue)) throw new ApiError(400, "INVALID_SEARCH", "Enter a search term of 1\u2013100 characters and a page from 1 to 10.");
         if (new RegExp("\\p{Script=Bengali}", "u").test(query)) throw new ApiError(422, "SEARCH_LANGUAGE_UNSUPPORTED", "Please search in English or Chinese for now. Bengali search is not available yet.");
-        respond(res, 200, await service.search(query, Number(pageValue)));
+        respond(res, 200, await service.search(query, Number(pageValue), language));
         return;
       }
       if (url.pathname.startsWith("/api/products/")) {
         const id2 = url.pathname.slice("/api/products/".length);
         if (!/^1688-[1-9]\d{0,31}$/.test(id2)) throw new ApiError(400, "INVALID_PRODUCT_ID", "Please select a valid catalog product.");
-        respond(res, 200, await service.detail(id2));
+        respond(res, 200, await service.detail(id2, false, language));
         return;
       }
       throw new ApiError(404, "NOT_FOUND", "This API endpoint was not found.");
@@ -696,7 +726,13 @@ function getCartLineProduct(product, item, productQuantity = item.quantity) {
 }
 
 // src/commerce.ts
-var currencies = /* @__PURE__ */ new Set(["TWD", "CNY", "USD"]);
+var shippingCountries = ["RU", "BY", "KZ", "AM", "KG", "MD", "PL", "TW"];
+function validPostalCode(country, value) {
+  if (typeof value !== "string") return false;
+  const patterns = { RU: /^\d{6}$/, BY: /^\d{6}$/, KZ: /^(?:\d{6}|[A-Z]\d{2}[A-Z]\d[A-Z]\d)$/i, AM: /^\d{4}$/, KG: /^\d{6}$/, MD: /^(?:MD-)?\d{4}$/i, PL: /^\d{2}-\d{3}$/, TW: /^\d{3}(?:\d{2,3})?$/ };
+  return shippingCountries.includes(country) && patterns[country].test(value);
+}
+var currencies = /* @__PURE__ */ new Set(["RUB", "USD", "EUR", "CNY", "TWD"]);
 var clone = (value) => structuredClone(value);
 function decimal(value) {
   if (!Number.isFinite(value)) fail("\u91D1\u984D\u4E0D\u662F\u6709\u6548\u6578\u5B57\u3002");
@@ -917,7 +953,12 @@ function calculateFreight(measurements, rate, selectedCurrency, at, revision = 1
   );
   if (!Number.isSafeInteger(steps)) fail("\u904B\u8CBB\u91CD\u91CF\u6B65\u9032\u8A2D\u5B9A\u8D85\u51FA\u53EF\u8655\u7406\u7BC4\u570D\u3002");
   const chargedWeightKg = Math.round((rate.firstWeightKg + steps * rate.stepWeightKg) * 1e6) / 1e6;
-  const total = tariffTotal(rate, steps);
+  let total = tariffTotal(rate, steps);
+  if (rate.pricingBasis === "cny_per_kg") {
+    const price = decimal(rate.priceCnyPerKg), weight = decimal(chargedWeightKg), fx = decimal(rate.exchangeRate);
+    const transportMinor = roundedRatio(price.numerator * weight.numerator * fx.numerator * 100n, price.denominator * weight.denominator * fx.denominator);
+    total = (Number(transportMinor) + cents(rate.handlingFee)) / 100;
+  }
   if (!validMoney(total)) fail("\u904B\u8CBB\u8D85\u51FA\u53EF\u8655\u7406\u7BC4\u570D\u3002");
   return {
     revision,
@@ -1213,14 +1254,31 @@ function withdrawalMonth(now) {
   return `${parts.year}-${parts.month}`;
 }
 
+// src/market-config.ts
+var defaultMarketRates = { RUB: 11, EUR: 0.13, CNY: 1, USD: 0.14, TWD: 4.6 };
+var defaultCurrency = "RUB";
+var supportedCurrencies = ["RUB", "EUR", "CNY", "USD", "TWD"];
+
 // server/platform/repository.ts
-var defaultSettings = { markupPercent: 20, specialGoodsPercent: 0, marketRates: { TWD: 4.5, CNY: 1, USD: 0.14 }, freightPerKg: 50, commissionPercent: 5, currency: "TWD" };
+var defaultSettings = { markupPercent: 20, specialGoodsPercent: 0, marketRates: { ...defaultMarketRates }, freightPerKg: 50, commissionPercent: 5, currency: defaultCurrency, shippingRoutes: shippingCountries.map((country) => ({ id: `CN-${country}`, name: `China \u2192 ${country}`, destinationCountry: country, carrier: "", enabled: false, priceCnyPerKg: 50, volumetricDivisor: 6e3, billingStepKg: 0.1, handlingFeeCny: 0 })) };
 async function settings(db) {
   const rows = await db.all("SELECT value FROM settings WHERE key=?", ["platform"]);
-  return rows[0] ? JSON.parse(rows[0].value) : structuredClone(defaultSettings);
+  if (!rows[0]) return structuredClone(defaultSettings);
+  const stored = JSON.parse(rows[0].value);
+  const rates = { ...stored.marketRates }, missing = [];
+  for (const code of supportedCurrencies) if (!Number.isFinite(rates[code]) || rates[code] <= 0) {
+    rates[code] = 0;
+    missing.push(code);
+  }
+  return { ...stored, marketRates: rates, shippingRoutes: stored.shippingRoutes ?? [], unconfiguredCurrencies: missing };
+}
+function exchangeRate(settings2, code) {
+  const rate = settings2.marketRates[code];
+  if (!Number.isFinite(rate) || rate <= 0 || rate > 1e3) return error(409, "RATE_NOT_CONFIGURED", `Exchange rate for ${code} requires operator confirmation.`);
+  return rate;
 }
 function currency2(value) {
-  if (!["TWD", "CNY", "USD"].includes(String(value))) return error(400, "INVALID_CURRENCY", "\u4E0D\u652F\u63F4\u6B64\u5E63\u5225\u3002");
+  if (!supportedCurrencies.includes(value)) return error(400, "INVALID_CURRENCY", "Unsupported currency.");
   return value;
 }
 function quantity(value, max = 9999) {
@@ -1233,9 +1291,9 @@ function amount(value, max = 1e6) {
 }
 function address(value) {
   const body = object2(value);
-  if (body.country !== "TW") return error(400, "INVALID_COUNTRY", "\u76EE\u524D\u914D\u9001\u5730\u5340\u70BA\u53F0\u7063\u3002");
-  const result = { name: text2(body.name, "\u6536\u4EF6\u4EBA", 100), phone: text2(body.phone, "\u96FB\u8A71", 50), city: text2(body.city, "\u7E23\u5E02", 100), district: text2(body.district, "\u5340\u57DF", 100, true), addressLine1: text2(body.addressLine1, "\u5730\u5740", 250), postalCode: text2(body.postalCode, "\u90F5\u905E\u5340\u865F", 6), country: "TW" };
-  if (!/^\d{3}(?:\d{2,3})?$/.test(result.postalCode)) return error(400, "INVALID_ADDRESS", "\u90F5\u905E\u5340\u865F\u4E0D\u6B63\u78BA\u3002");
+  if (!shippingCountries.includes(body.country)) return error(400, "INVALID_COUNTRY", "Unsupported destination country.");
+  const result = { name: text2(body.name, "Recipient", 100), phone: text2(body.phone, "Phone", 50), city: text2(body.city, "City", 100), district: text2(body.district, "District", 100, true), addressLine1: text2(body.addressLine1, "Address", 250), postalCode: text2(body.postalCode, "Postal code", 10).toUpperCase(), country: body.country };
+  if (!validPostalCode(result.country, result.postalCode)) return error(400, "INVALID_ADDRESS", "Postal code does not match the destination country.");
   return result;
 }
 function packing(value) {
@@ -1348,6 +1406,38 @@ function unavailable(provider, reason) {
   return { provider, configured: false, mode: "unavailable", capabilities: [], reason };
 }
 
+// server/platform/shipping.ts
+function validateShippingRoutes(value) {
+  if (!Array.isArray(value) || value.length > 50) return error(400, "INVALID_ROUTES", "\u8BF7\u63D0\u4F9B\u6700\u591A50\u6761\u914D\u9001\u7EBF\u8DEF\u3002");
+  const ids = /* @__PURE__ */ new Set();
+  return value.map((entry) => {
+    const row2 = object2(entry), id2 = text2(row2.id, "\u7EBF\u8DEF\u7F16\u53F7", 60);
+    if (!/^[A-Za-z0-9_-]+$/.test(id2) || ids.has(id2)) return error(400, "INVALID_ROUTE", "\u7EBF\u8DEF\u7F16\u53F7\u5FC5\u987B\u552F\u4E00\u4E14\u4EC5\u542B\u82F1\u6587\u3001\u6570\u5B57\u3001\u77ED\u6A2A\u7EBF\u6216\u4E0B\u5212\u7EBF\u3002");
+    ids.add(id2);
+    if (!shippingCountries.includes(row2.destinationCountry) || typeof row2.enabled !== "boolean") return error(400, "INVALID_ROUTE", "\u7EBF\u8DEF\u76EE\u7684\u56FD\u6216\u542F\u7528\u72B6\u6001\u4E0D\u6B63\u786E\u3002");
+    const carrier = text2(row2.carrier, "\u627F\u8FD0\u5546", 100, !row2.enabled);
+    const priceCnyPerKg = amount(row2.priceCnyPerKg, 1e5), handlingFeeCny = amount(row2.handlingFeeCny, 1e4);
+    if (row2.enabled && priceCnyPerKg <= 0) return error(400, "INVALID_ROUTE", "\u542F\u7528\u7EBF\u8DEF\u524D\u5FC5\u987B\u586B\u5199\u6709\u6548\u8FD0\u4EF7\u3002");
+    if (typeof row2.volumetricDivisor !== "number" || !Number.isInteger(row2.volumetricDivisor) || row2.volumetricDivisor < 1e3 || row2.volumetricDivisor > 1e4 || typeof row2.billingStepKg !== "number" || ![0.01, 0.05, 0.1, 0.5, 1].includes(row2.billingStepKg)) return error(400, "INVALID_ROUTE", "\u6750\u79EF\u5206\u6BCD\u6216\u8BA1\u8D39\u91CD\u91CF\u6B65\u8FDB\u4E0D\u6B63\u786E\u3002");
+    return { id: id2, name: text2(row2.name, "\u7EBF\u8DEF\u540D\u79F0", 150), destinationCountry: row2.destinationCountry, carrier, enabled: row2.enabled, priceCnyPerKg, volumetricDivisor: row2.volumetricDivisor, billingStepKg: row2.billingStepKg, handlingFeeCny };
+  });
+}
+function routeFreightRate(settings2, routeId, destination, currency3, handlingFee) {
+  const route = settings2.shippingRoutes.find((item) => item.id === routeId);
+  if (!route || !route.enabled) return error(409, "SHIPPING_ROUTE_UNAVAILABLE", "\u6B64\u914D\u9001\u7EBF\u8DEF\u5C1A\u672A\u786E\u8BA4\u6216\u672A\u542F\u7528\uFF0C\u8BF7\u8054\u7CFB\u8FD0\u8425\u786E\u8BA4\u3002");
+  if (destination && route.destinationCountry !== destination) return error(400, "SHIPPING_DESTINATION_MISMATCH", "\u6240\u9009\u7EBF\u8DEF\u4E0E\u5305\u88F9\u76EE\u7684\u56FD\u5BB6\u4E0D\u7B26\u3002");
+  const fx = exchangeRate(settings2, currency3), step = route.billingStepKg;
+  return { pricingBasis: "cny_per_kg", label: route.name, routeId: route.id, destinationCountry: route.destinationCountry, carrier: route.carrier, currency: currency3, exchangeRate: fx, priceCnyPerKg: route.priceCnyPerKg, firstWeightKg: step, stepWeightKg: step, firstPrice: Math.round(route.priceCnyPerKg * fx * step * 100) / 100, stepPrice: Math.round(route.priceCnyPerKg * fx * step * 100) / 100, volumetricDivisor: route.volumetricDivisor, handlingFee: handlingFee === void 0 ? Math.round(route.handlingFeeCny * fx * 100) / 100 : amount(handlingFee, 1e6) };
+}
+function estimateShipping(settings2, input, now) {
+  const rate = routeFreightRate(settings2, input.routeId, void 0, input.currency);
+  try {
+    return { quote: calculateFreight(input.measurements, rate, input.currency, now), estimate: true };
+  } catch {
+    return error(400, "INVALID_MEASUREMENTS", "\u8BF7\u586B\u5199\u6709\u6548\u7684\u5305\u88F9\u91CD\u91CF\u4E0E\u957F\u5BBD\u9AD8\u3002");
+  }
+}
+
 // server/platform/service.ts
 function canonical(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -1365,7 +1455,11 @@ var PlatformService = class {
     return (this.options.now?.() ?? /* @__PURE__ */ new Date()).toISOString();
   }
   capabilities() {
-    return { payments: Boolean(this.options.payment?.status.configured && this.options.payment.status.mode === "live"), catalog: Boolean(this.options.catalog), shipping: false, paymentProvider: this.options.payment?.status.configured ? this.options.payment.status.provider : null, affiliateWithdrawals: true, emailVerification: Boolean(this.options.notifications?.email.status.configured), passwordReset: Boolean(this.options.notifications?.email.status.configured), paymentMode: this.options.payment?.status.mode ?? "unavailable", emailNotifications: Boolean(this.options.notifications?.email.status.configured), smsNotifications: Boolean(this.options.notifications?.sms.status.configured) };
+    return { paymentChannels: this.options.payment ? (this.options.payment.methods ?? ["card"]).filter((method) => !["stripe", "online"].includes(method)).map((method) => ({ provider: this.options.payment.status.provider, method, currencies: this.options.payment.currencies ?? ["TWD", "USD", "EUR", "CNY"], configured: this.options.payment.status.configured && this.options.payment.status.mode === "live", mode: this.options.payment.status.mode })) : [], payments: Boolean(this.options.payment?.status.configured && this.options.payment.status.mode === "live"), catalog: Boolean(this.options.catalog), shipping: false, paymentProvider: this.options.payment?.status.configured ? this.options.payment.status.provider : null, affiliateWithdrawals: true, emailVerification: Boolean(this.options.notifications?.email.status.configured), passwordReset: Boolean(this.options.notifications?.email.status.configured), paymentMode: this.options.payment?.status.mode ?? "unavailable", emailNotifications: Boolean(this.options.notifications?.email.status.configured), smsNotifications: Boolean(this.options.notifications?.sms.status.configured) };
+  }
+  async shippingEstimate(input) {
+    const body = object2(input);
+    return estimateShipping(await settings(this.db), { routeId: body.routeId, currency: currency2(body.currency), measurements: object2(body.measurements) }, this.now());
   }
   async publicConfig() {
     return { settings: await settings(this.db), capabilities: this.capabilities() };
@@ -1420,8 +1514,8 @@ var PlatformService = class {
       products.push(product);
     }
     const settings2 = await settings(this.db);
-    const rules = { ...defaultPricingRules, markupPercent: settings2.markupPercent, specialGoodsPercent: settings2.specialGoodsPercent, exchangeRate: settings2.marketRates[currency3] };
-    const quote = quoteGoods(items, products, rules, currency3, { coinUsed: requestedCoins, coinExchangeRate: settings2.marketRates[currency3] / settings2.marketRates.TWD, walletCoins: user ? (await walletFor(this.db, user.id)).spendable : 0 });
+    const rules = { ...defaultPricingRules, markupPercent: settings2.markupPercent, specialGoodsPercent: settings2.specialGoodsPercent, exchangeRate: exchangeRate(settings2, currency3) };
+    const quote = quoteGoods(items, products, rules, currency3, { coinUsed: requestedCoins, coinExchangeRate: exchangeRate(settings2, currency3) / exchangeRate(settings2, "TWD"), walletCoins: user ? (await walletFor(this.db, user.id)).spendable : 0 });
     if (!quote.canCheckout) return error(409, "CART_UNAVAILABLE", quote.issues[0] || "\u5546\u54C1\u66AB\u4E0D\u53EF\u8CFC\u8CB7\u3002");
     if (quote.merchandise <= 0) return error(409, "INVALID_PRICE", "\u5546\u54C1\u50F9\u683C\u5C1A\u5F85\u78BA\u8A8D\u3002");
     return { quote, settings: settings2 };
@@ -1576,8 +1670,8 @@ var PlatformService = class {
         await this.noActivePayment(tx, parcel.id);
         const raw = object2(body.measurements);
         const measurements = Object.fromEntries(["actualWeightKg", "lengthCm", "widthCm", "heightCm"].map((field) => [field, raw[field]]));
-        const settings2 = await settings(tx), exchangeRate = settings2.marketRates[parcel.currency], step = 0.1;
-        const rate = { label: `\u6BCF${step}kg\uFF0CCNY ${settings2.freightPerKg}/kg`, currency: parcel.currency, exchangeRate, priceCnyPerKg: settings2.freightPerKg, firstWeightKg: step, stepWeightKg: step, firstPrice: Math.round(settings2.freightPerKg * exchangeRate * step * 100) / 100, stepPrice: Math.round(settings2.freightPerKg * exchangeRate * step * 100) / 100, volumetricDivisor: 6e3, handlingFee: amount(body.handlingFee ?? 0, 1e4) };
+        const settings2 = await settings(tx);
+        const rate = routeFreightRate(settings2, body.routeId, parcel.address.country, parcel.currency, body.handlingFee);
         try {
           parcel.freightQuote = calculateFreight(measurements, rate, parcel.currency, now, (parcel.freightQuote?.revision ?? 0) + 1);
         } catch {
@@ -1590,6 +1684,7 @@ var PlatformService = class {
         if (parcel.rehearsal) parcel.rehearsalCompletedAt = now;
       } else if (body.type === "dispatchParcel") {
         if (parcel.status !== "submitted" || !parcel.freightPayment) return error(409, "SHIPMENT_NOT_SUBMITTED", "\u904B\u8CBB\u4ED8\u6E05\u4E14\u9867\u5BA2\u78BA\u8A8D\u5BC4\u9001\u5F8C\u624D\u80FD\u51FA\u8CA8\u3002");
+        if (parcel.freightQuote?.rate.carrier && text2(body.carrier, "\u7269\u6D41\u5546", 100) !== parcel.freightQuote.rate.carrier) return error(409, "SHIPPING_CARRIER_CHANGED", "\u627F\u8FD0\u5546\u4E0E\u5DF2\u652F\u4ED8\u62A5\u4EF7\u4E0D\u4E00\u81F4\uFF0C\u8BF7\u5148\u4EBA\u5DE5\u786E\u8BA4\u8C03\u6574\u65B9\u6848\u3002");
         parcel.tracking = { carrier: text2(body.carrier, "\u7269\u6D41\u5546", 100), number: text2(body.trackingNumber, "\u570B\u969B\u55AE\u865F", 150), shippedAt: now };
         parcel.status = "shipped";
       } else if (body.type === "deliverParcel") {
@@ -1620,9 +1715,10 @@ var PlatformService = class {
   async updateSettings(user, key, input) {
     this.staff(user, ["admin"]);
     const body = object2(input), rates = object2(body.marketRates);
-    const settings2 = { markupPercent: amount(body.markupPercent, 1e3), specialGoodsPercent: amount(body.specialGoodsPercent, 100), marketRates: { TWD: 0, CNY: 1, USD: 0 }, freightPerKg: amount(body.freightPerKg, 1e5), commissionPercent: amount(body.commissionPercent, 100), currency: currency2(body.currency) };
-    for (const code of ["TWD", "CNY", "USD"]) {
-      if (typeof rates[code] !== "number" || !Number.isFinite(rates[code]) || rates[code] <= 0 || rates[code] > 1e3) return error(400, "INVALID_RATE", "\u532F\u7387\u8A2D\u5B9A\u4E0D\u6B63\u78BA\u3002");
+    const current = await settings(this.db);
+    const settings2 = { markupPercent: amount(body.markupPercent, 1e3), specialGoodsPercent: amount(body.specialGoodsPercent, 100), marketRates: { RUB: 0, EUR: 0, TWD: 0, CNY: 1, USD: 0 }, freightPerKg: amount(body.freightPerKg, 1e5), commissionPercent: amount(body.commissionPercent, 100), currency: currency2(body.currency), shippingRoutes: body.shippingRoutes === void 0 ? current.shippingRoutes : validateShippingRoutes(body.shippingRoutes) };
+    for (const code of supportedCurrencies) {
+      if (typeof rates[code] !== "number" || !Number.isFinite(rates[code]) || rates[code] <= 0 || rates[code] > 1e3) return error(400, "INVALID_RATE", "Every supported currency requires an explicit positive rate per CNY.");
       settings2.marketRates[code] = rates[code];
     }
     if (settings2.marketRates.CNY !== 1) return error(400, "INVALID_RATE", "\u4EBA\u6C11\u5E63\u5C0D\u4EBA\u6C11\u5E63\u532F\u7387\u5FC5\u9808\u662F1\u3002");
@@ -1663,9 +1759,10 @@ var PlatformService = class {
     }
     if (!this.options.payment?.status.configured || this.options.payment.status.mode !== "live") return error(503, "PAYMENT_NOT_CONFIGURED", "\u652F\u4ED8\u670D\u52D9\u5C1A\u672A\u914D\u7F6E\uFF1B\u6B64\u8A02\u55AE\u5C1A\u672A\u4ED8\u6B3E\uFF0C\u4E5F\u4E0D\u6703\u958B\u59CB\u63A1\u8CFC\u3002");
     const provider = this.options.payment.status.provider;
-    if (body.method !== void 0 && !["stripe", "card", "online"].includes(String(body.method))) return error(400, "PAYMENT_METHOD_UNAVAILABLE", "\u6B64\u652F\u4ED8\u65B9\u5F0F\u5C1A\u672A\u555F\u7528\u3002");
+    if (body.method !== void 0 && !(this.options.payment.methods ?? ["stripe", "card", "online"]).includes(String(body.method))) return error(400, "PAYMENT_METHOD_UNAVAILABLE", "\u6B64\u652F\u4ED8\u65B9\u5F0F\u5C1A\u672A\u555F\u7528\u3002");
     const reservation = await this.mutate(user, key, `/${targetType}s/${targetId}/payment`, input, async (tx) => {
       const target = targetType === "order" ? await orderById(tx, targetId, user.id) : await parcelById(tx, targetId, user.id);
+      if (this.options.payment?.currencies && !this.options.payment.currencies.includes(target.currency)) return error(409, "PAYMENT_CURRENCY_UNSUPPORTED", "This payment channel does not accept the order currency; the order has not been converted or charged.");
       let due, quoteRevision;
       if ("paymentStatus" in target) {
         if (target.paymentStatus !== "pending") return error(409, "NOT_PAYABLE", "\u6B64\u8A02\u55AE\u76EE\u524D\u4E0D\u53EF\u4ED8\u6B3E\u3002");
@@ -1680,7 +1777,7 @@ var PlatformService = class {
       await this.noActivePayment(tx, targetId);
       if (due <= 0) return error(409, "INVALID_PAYMENT_AMOUNT", "\u4ED8\u6B3E\u91D1\u984D\u9700\u8981\u78BA\u8A8D\u3002");
       const attemptId = id(), reference = `PAY-${attemptId}`, now = this.now();
-      await tx.run("INSERT INTO payment_attempts (id,user_id,reference,target_type,target_id,provider,provider_payment_id,amount_minor,currency,status,payload,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [attemptId, user.id, reference, targetType, targetId, provider, null, Math.round(due * 100), target.currency, "creating", JSON.stringify({ quoteRevision }), now]);
+      await tx.run("INSERT INTO payment_attempts (id,user_id,reference,target_type,target_id,provider,provider_payment_id,amount_minor,currency,status,payload,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", [attemptId, user.id, reference, targetType, targetId, provider, null, Math.round(due * 100), target.currency, "creating", JSON.stringify({ quoteRevision, method: body.method }), now]);
       await audit(tx, user.id, user.id, "payment_initiated", targetId, { reference, amount: due, currency: target.currency }, now);
       return { attemptId };
     });
@@ -1692,7 +1789,7 @@ var PlatformService = class {
     if (attempt.status === "failed") return error(409, "PAYMENT_FAILED", "\u6B64\u4ED8\u6B3E\u5DF2\u7D50\u675F\uFF0C\u8ACB\u4EE5\u65B0\u7684\u64CD\u4F5C\u91CD\u65B0\u4ED8\u6B3E\u3002");
     let session;
     try {
-      session = await this.options.payment.createPayment({ idempotencyKey: reservation.attemptId, reference: attempt.reference, amountMinor: Number(attempt.amount_minor), currency: attempt.currency, successUrl: `${this.options.publicOrigin}/?payment=return`, cancelUrl: `${this.options.publicOrigin}/?payment=canceled`, customerEmail: user.email });
+      session = await this.options.payment.createPayment({ idempotencyKey: reservation.attemptId, reference: attempt.reference, amountMinor: Number(attempt.amount_minor), currency: attempt.currency, method: existing.method, successUrl: `${this.options.publicOrigin}/?payment=return`, cancelUrl: `${this.options.publicOrigin}/?payment=canceled`, customerEmail: user.email });
     } catch (reason) {
       if (reason instanceof IntegrationError && ["provider_rejected", "invalid_request"].includes(reason.code)) await this.db.transaction(async (tx) => {
         await lockUser(tx, user.id);
@@ -1723,6 +1820,28 @@ var PlatformService = class {
       const attempt = (await tx.all("SELECT * FROM payment_attempts WHERE reference=? AND provider=?", [event.reference, event.provider]))[0];
       if (Number(attempt.amount_minor) !== event.amountMinor || attempt.currency !== event.currency || attempt.provider_payment_id && attempt.provider_payment_id !== event.providerPaymentId) return error(409, "PAYMENT_MISMATCH", "\u652F\u4ED8\u8CC7\u6599\u8207\u8A02\u55AE\u4E0D\u4E00\u81F4\uFF0C\u5C1A\u672A\u5165\u5E33\u3002");
       const now = this.now();
+      const review = async (reason) => {
+        await tx.run("INSERT INTO payment_events (provider,event_id,created_at) VALUES (?,?,?)", [event.provider, event.eventId, now]);
+        await audit(tx, null, attempt.user_id, "payment_reconciliation_required", attempt.target_id, { reference: event.reference, provider: event.provider, providerPaymentId: event.providerPaymentId, amountMinor: event.amountMinor, currency: event.currency, providerStatus: event.providerStatus ?? event.status, reason }, now);
+        await notify(tx, attempt.user_id, "payment_review", "Payment requires review", "A payment update has been recorded for manual reconciliation. No duplicate order has been released.", now);
+        return { received: true };
+      };
+      if (event.status === "review") return review("provider_reversal_or_amount_review");
+      if (event.provider === "cashera" && event.status === "paid" && attempt.status !== "paid") {
+        if (attempt.target_type === "order") {
+          const target = await orderById(tx, attempt.target_id, attempt.user_id);
+          if (target.paymentStatus !== "pending") return review("order_already_settled_or_canceled");
+          const competing = await tx.all("SELECT id FROM payment_attempts WHERE target_id=? AND id<>? AND status IN ('creating','pending','paid')", [attempt.target_id, attempt.id]);
+          if (competing.length) return review("another_payment_attempt_exists");
+          if (target.coinUsed > 0 && attempt.status === "failed") {
+            if ((await walletFor(tx, attempt.user_id)).spendable < target.coinUsed) return review("late_payment_coin_balance_insufficient");
+            await reserveCoins(tx, attempt.user_id, `order:${target.id}`, target.coinUsed, "order", now);
+          }
+        } else {
+          const target = await parcelById(tx, attempt.target_id, attempt.user_id), payload = JSON.parse(attempt.payload);
+          if (target.status !== "quoted" || target.freightQuote?.revision !== payload.quoteRevision) return review("freight_quote_changed");
+        }
+      }
       if (event.status === "paid" && attempt.status !== "paid") {
         if (attempt.target_type === "order") {
           const order = await orderById(tx, attempt.target_id, attempt.user_id);
@@ -1939,10 +2058,17 @@ function createPlatformHandler(options) {
         return true;
       }
       rateLimit(req, path);
-      if (path === "/webhooks/stripe" && method === "POST") {
-        if (!options.payment?.status.configured) return error(503, "PAYMENT_NOT_CONFIGURED", "\u652F\u4ED8\u670D\u52D9\u5C1A\u672A\u914D\u7F6E\u3002");
-        const event = options.payment.verifyWebhook(await readBody(req, true), String(req.headers["stripe-signature"] || ""));
+      if (["/webhooks/stripe", "/webhooks/cashera"].includes(path) && method === "POST") {
+        const provider = path.split("/").at(-1);
+        if (!options.payment?.status.configured || options.payment.status.provider !== provider) return error(503, "PAYMENT_NOT_CONFIGURED", "Payment provider is not configured.");
+        let event = options.payment.verifyWebhook(await readBody(req, true), String(req.headers["stripe-signature"] || ""), void 0, { "x-api-key": typeof req.headers["x-api-key"] === "string" ? req.headers["x-api-key"] : void 0, "x-secret": typeof req.headers["x-secret"] === "string" ? req.headers["x-secret"] : void 0 });
+        if (event && options.payment.reconcilePayment) event = await options.payment.reconcilePayment(event);
         send(200, event ? await service.recordVerifiedPayment(event) : { received: true, ignored: true });
+        return true;
+      }
+      if (path === "/shipping/estimate" && method === "POST") {
+        protectWrite(req, config, null);
+        send(200, await service.shippingEstimate(jsonBody(await readBody(req))));
         return true;
       }
       const session = await loadSession(db, req, config, service.now());
@@ -2116,7 +2242,7 @@ function createPlatformHandler(options) {
         return true;
       }
       if (reason instanceof PlatformError) send(reason.status, { error: { code: reason.code, message: reason.message } });
-      else if (reason instanceof IntegrationError) send(reason.code === "invalid_signature" ? 400 : reason.code === "not_configured" ? 503 : 502, { error: { code: `INTEGRATION_${reason.code.toUpperCase()}`, message: reason.code === "invalid_signature" ? "\u652F\u4ED8\u7C3D\u7AE0\u4E0D\u6B63\u78BA\u3002" : "\u5916\u90E8\u670D\u52D9\u5C1A\u672A\u78BA\u8A8D\u6B64\u64CD\u4F5C\uFF0C\u8ACB\u7A0D\u5F8C\u91CD\u8A66\u3002" } });
+      else if (reason instanceof IntegrationError) send(reason.code === "invalid_signature" ? 401 : reason.code === "not_configured" ? 503 : 502, { error: { code: `INTEGRATION_${reason.code.toUpperCase()}`, message: reason.code === "invalid_signature" ? "\u652F\u4ED8\u7C3D\u7AE0\u4E0D\u6B63\u78BA\u3002" : "\u5916\u90E8\u670D\u52D9\u5C1A\u672A\u78BA\u8A8D\u6B64\u64CD\u4F5C\uFF0C\u8ACB\u7A0D\u5F8C\u91CD\u8A66\u3002" } });
       else send(500, { error: { code: "PLATFORM_UNAVAILABLE", message: "\u670D\u52D9\u66AB\u6642\u7121\u6CD5\u5B8C\u6210\u64CD\u4F5C\uFF0C\u8ACB\u7A0D\u5F8C\u518D\u8A66\u3002" } });
     }
     return true;
@@ -2587,9 +2713,102 @@ function createProcurementServiceFromEnv(database, env = process.env) {
   });
 }
 
+// server/integrations/cashera.ts
+import { createHash as createHash3, timingSafeEqual as timingSafeEqual3 } from "node:crypto";
+var base = "https://api.cashera.cash/api/v1/integration/transactions";
+var uuidPattern = /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/i;
+function equalSecret(a, b) {
+  return typeof a === "string" && a.length < 2048 && timingSafeEqual3(createHash3("sha256").update(a).digest(), createHash3("sha256").update(b).digest());
+}
+function transactionEvent(value) {
+  const t = object3(value);
+  if (t.type !== "deposit" || typeof t.uuid !== "string" || !uuidPattern.test(t.uuid) || t.currency !== "RUB") throw new IntegrationError("invalid_request", "Invalid payment transaction.");
+  assertReference(t.external_id);
+  assertMinor(t.amount);
+  const status = String(t.status);
+  if (["pending", "processing"].includes(status)) return null;
+  if (!["paid", "failed", "canceled", "expired", "refunded", "chargeback"].includes(status)) return null;
+  const at = t.paid_at ?? t.updated_at ?? t.created_at;
+  return { provider: "cashera", eventId: `${t.uuid}:${status}`, providerPaymentId: t.uuid, reference: t.external_id, amountMinor: t.amount, currency: "RUB", status: status === "paid" ? t.gross_amount === t.amount ? "paid" : "review" : ["refunded", "chargeback"].includes(status) ? "review" : "failed", providerStatus: status, occurredAt: typeof at === "string" && Number.isFinite(Date.parse(at)) ? new Date(at).toISOString() : (/* @__PURE__ */ new Date()).toISOString() };
+}
+function createCasheraAdapter(env = process.env, fetcher = fetch) {
+  const key = env.CASHERA_API_KEY || "", secret = env.CASHERA_API_SECRET || "";
+  const app = validHttpsUrl(env.PUBLIC_APP_URL), callback = validHttpsUrl(env.CASHERA_CALLBACK_URL);
+  const checkoutHost = (env.CASHERA_CHECKOUT_HOST || "").trim().toLowerCase();
+  const customHost = checkoutHost && /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(checkoutHost) && !checkoutHost.endsWith(".local") && !checkoutHost.endsWith(".internal") && !checkoutHost.includes("..") ? checkoutHost : null;
+  const checkoutHosts = /* @__PURE__ */ new Set(["pay.cashera.cash", ...customHost ? [customHost] : []]);
+  const methods = [...new Set((env.CASHERA_METHODS || "").split(",").map((x) => x.trim()).filter((x) => ["sbp", "card"].includes(x)))];
+  const configured = env.CASHERA_ENABLED === "true" && env.CASHERA_MERCHANT_CONFIRMED === "true" && key.startsWith("pk_") && secret.startsWith("sk_") && !!app && !!callback && callback.pathname === "/api/platform/webhooks/cashera" && methods.length > 0 && (!checkoutHost || !!customHost);
+  const status = configured ? { provider: "cashera", configured: true, mode: "live", capabilities: ["hosted_sbp_card", "authenticated_webhook", "server_status_reconciliation"], reason: "Explicitly enabled merchant methods; RUB only, no automatic currency conversion." } : unavailable("cashera", "Requires explicitly confirmed merchant activation, RUB methods, API credentials and the HTTPS Cashera callback.");
+  const ready = () => {
+    if (!configured) throw new IntegrationError("not_configured", status.reason);
+  };
+  async function request(url, init) {
+    let response;
+    try {
+      response = await fetcher(url, { ...init, redirect: "error", signal: AbortSignal.timeout(2e4), headers: { "X-Api-Key": key, Accept: "application/json", "Content-Type": "application/json" } });
+    } catch {
+      throw new IntegrationError("unknown_outcome", "Payment provider outcome is unknown; reconcile the existing attempt before retrying.");
+    }
+    if (!response.ok) throw new IntegrationError(response.status >= 500 || [408, 409, 429].includes(response.status) ? "unknown_outcome" : "provider_rejected", "Payment provider did not confirm this request.");
+    const length = Number(response.headers.get("content-length"));
+    if (length > 1e6) throw new IntegrationError("unknown_outcome", "Payment response is invalid.");
+    const body = await response.text().catch(() => "");
+    if (body.length > 1e6) throw new IntegrationError("unknown_outcome", "Payment response is invalid.");
+    try {
+      return object3(JSON.parse(body));
+    } catch {
+      throw new IntegrationError("unknown_outcome", "Payment response is invalid.");
+    }
+  }
+  function validate(input) {
+    ready();
+    assertReference(input.reference);
+    assertReference(input.idempotencyKey);
+    assertMinor(input.amountMinor);
+    if (input.currency !== "RUB") throw new IntegrationError("invalid_request", "Cashera accepts RUB only; no automatic currency conversion is performed.");
+    if (!input.method || !methods.includes(input.method)) throw new IntegrationError("invalid_request", "This merchant payment method is not enabled.");
+    if (input.method === "card" && input.amountMinor < 5e3) throw new IntegrationError("invalid_request", "Cashera card payments require at least RUB 50.");
+    for (const value of [input.successUrl, input.cancelUrl]) if (validHttpsUrl(value)?.origin !== app.origin) throw new IntegrationError("invalid_request", "Invalid payment return origin.");
+  }
+  return {
+    status,
+    currencies: ["RUB"],
+    methods: methods.length ? methods : ["sbp", "card"],
+    async createPayment(input) {
+      validate(input);
+      const data = await request(base, { method: "POST", body: JSON.stringify({ amount: input.amountMinor, currency: "RUB", payment_method: input.method, external_id: input.reference, description: `CNBUY ${input.reference}`, callback_url: callback.href, success_url: input.successUrl, fail_url: input.cancelUrl }) });
+      const pay = typeof data.payment_url === "string" ? validHttpsUrl([...checkoutHosts].some((host) => data.payment_url === host || String(data.payment_url).startsWith(`${host}/`)) ? `https://${data.payment_url}` : data.payment_url) : null;
+      if (typeof data.uuid !== "string" || !uuidPattern.test(data.uuid) || data.type !== "deposit" || data.external_id !== input.reference || data.amount !== input.amountMinor || data.currency !== "RUB" || data.payment_method !== input.method || !pay || !checkoutHosts.has(pay.hostname) || pay.port !== "") throw new IntegrationError("unknown_outcome", "Payment session cannot be reconciled.");
+      if (data.gross_amount !== input.amountMinor || data.fee_payer !== "merchant") throw new IntegrationError("unknown_outcome", "Merchant fee configuration changed the approved payment amount; manual reconciliation is required.");
+      return { provider: "cashera", providerPaymentId: data.uuid, checkoutUrl: pay.href, status: "pending" };
+    },
+    verifyWebhook(rawBody, _signature, _now, headers) {
+      ready();
+      if (Buffer.byteLength(rawBody) > 1e6 || !equalSecret(headers?.["x-api-key"], key) || !equalSecret(headers?.["x-secret"], secret)) throw new IntegrationError("invalid_signature", "Invalid Cashera webhook credentials.");
+      let event;
+      try {
+        event = object3(JSON.parse(rawBody.toString()));
+      } catch {
+        throw new IntegrationError("invalid_request", "Invalid payment event.");
+      }
+      if (event.event !== "transaction.status_updated") return null;
+      return transactionEvent(event.transaction);
+    },
+    async reconcilePayment(event) {
+      ready();
+      if (event.provider !== "cashera" || !uuidPattern.test(event.providerPaymentId)) throw new IntegrationError("invalid_request", "Invalid reconciliation reference.");
+      const current = transactionEvent(await request(`${base}/${event.providerPaymentId}`, { method: "GET" }));
+      if (!current || current.providerPaymentId !== event.providerPaymentId || current.reference !== event.reference || current.amountMinor !== event.amountMinor || current.currency !== event.currency) throw new IntegrationError("unknown_outcome", "Payment status could not be reconciled; no ledger entry was made.");
+      return current;
+    }
+  };
+}
+
 // server/integrations/payments.ts
-import { createHmac as createHmac2, timingSafeEqual as timingSafeEqual3 } from "node:crypto";
+import { createHmac as createHmac2, timingSafeEqual as timingSafeEqual4 } from "node:crypto";
 function createPaymentAdapter(env = process.env, fetcher = fetch) {
+  if (env.PAYMENT_PROVIDER === "cashera") return createCasheraAdapter(env, fetcher);
   const mode = env.STRIPE_MODE;
   const secret = env.STRIPE_SECRET_KEY || "";
   const webhookSecret = env.STRIPE_WEBHOOK_SECRET || "";
@@ -2601,12 +2820,14 @@ function createPaymentAdapter(env = process.env, fetcher = fetch) {
   };
   return {
     status,
+    currencies: ["TWD", "USD", "EUR", "CNY"],
+    methods: ["card", "stripe", "online"],
     async createPayment(input) {
       ready();
       assertReference(input.reference);
       assertReference(input.idempotencyKey, "idempotency key");
       assertMinor(input.amountMinor);
-      if (!["TWD", "USD", "CNY"].includes(input.currency)) throw new IntegrationError("invalid_request", "Unsupported currency.");
+      if (!["TWD", "USD", "EUR", "CNY"].includes(input.currency)) throw new IntegrationError("invalid_request", "Unsupported currency.");
       for (const value of [input.successUrl, input.cancelUrl]) {
         const url2 = validHttpsUrl(value);
         if (!url2 || url2.origin !== app.origin) throw new IntegrationError("invalid_request", "Checkout redirects must use the configured app origin.");
@@ -2658,7 +2879,7 @@ function createPaymentAdapter(env = process.env, fetcher = fetch) {
       const timestamp = timestamps.length === 1 && /^\d+$/.test(timestamps[0][1] || "") ? Number(timestamps[0][1]) : NaN;
       if (!Number.isSafeInteger(timestamp) || !Number.isFinite(now) || Math.abs(now - timestamp) > 300) throw new IntegrationError("invalid_signature", "Payment signature timestamp is invalid or expired.");
       const expected = createHmac2("sha256", webhookSecret).update(`${timestamp}.`).update(rawBody).digest();
-      const valid = parts.some(([key, value]) => key === "v1" && /^[a-fA-F0-9]{64}$/.test(value || "") && timingSafeEqual3(expected, Buffer.from(value, "hex")));
+      const valid = parts.some(([key, value]) => key === "v1" && /^[a-fA-F0-9]{64}$/.test(value || "") && timingSafeEqual4(expected, Buffer.from(value, "hex")));
       if (!valid) throw new IntegrationError("invalid_signature", "Invalid payment signature.");
       let event;
       try {
@@ -2679,7 +2900,7 @@ function createPaymentAdapter(env = process.env, fetcher = fetch) {
       if (object3(session.metadata).reference !== reference) throw new IntegrationError("invalid_request", "Payment reference mismatch.");
       assertMinor(session.amount_total);
       const currency3 = String(session.currency).toUpperCase();
-      if (!["TWD", "USD", "CNY"].includes(currency3) || typeof event.id !== "string" || !/^evt_[A-Za-z0-9_]+$/.test(event.id) || typeof session.id !== "string" || !/^cs_[A-Za-z0-9_]+$/.test(session.id) || !Number.isSafeInteger(event.created) || event.created <= 0 || event.created > 253402300799) {
+      if (!["TWD", "USD", "EUR", "CNY"].includes(currency3) || typeof event.id !== "string" || !/^evt_[A-Za-z0-9_]+$/.test(event.id) || typeof session.id !== "string" || !/^cs_[A-Za-z0-9_]+$/.test(session.id) || !Number.isSafeInteger(event.created) || event.created <= 0 || event.created > 253402300799) {
         throw new IntegrationError("invalid_request", "Invalid payment event fields.");
       }
       return {
@@ -2697,7 +2918,7 @@ function createPaymentAdapter(env = process.env, fetcher = fetch) {
 }
 
 // server/integrations/notifications.ts
-import { createHash as createHash3 } from "node:crypto";
+import { createHash as createHash4 } from "node:crypto";
 import nodemailer from "nodemailer";
 var emailPattern = /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/;
 function validateEmail(input) {
@@ -2761,7 +2982,7 @@ function createNotificationAdapters(env = process.env, dependencies = {}) {
           disableFileAccess: true,
           disableUrlAccess: true
         });
-        const messageId = `<${createHash3("sha256").update(input.idempotencyKey).digest("hex")}@${smtpFrom.split("@")[1]}>`;
+        const messageId = `<${createHash4("sha256").update(input.idempotencyKey).digest("hex")}@${smtpFrom.split("@")[1]}>`;
         let response;
         try {
           response = await transport.sendMail({ from: smtpFrom, to: input.to, subject: input.subject, text: input.text, messageId, disableFileAccess: true, disableUrlAccess: true });
@@ -2936,7 +3157,7 @@ async function startServer() {
         } catch {
         }
         res.writeHead(ready ? 200 : 503, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-        res.end(JSON.stringify({ ready, service: "cnbuy-platform", version: "0.6.0" }));
+        res.end(JSON.stringify({ ready, service: "cnbuy-platform", version: "0.7.0" }));
         return true;
       }
       return handler(req, res);
