@@ -1255,7 +1255,7 @@ function withdrawalMonth(now) {
 }
 
 // src/market-config.ts
-var defaultMarketRates = { RUB: 11, EUR: 0.13, CNY: 1, USD: 0.14, TWD: 4.6 };
+var defaultMarketRates = { RUB: 11, EUR: 0.13, CNY: 1, USD: 0.14, TWD: 4.5 };
 var defaultCurrency = "RUB";
 var supportedCurrencies = ["RUB", "EUR", "CNY", "USD", "TWD"];
 
@@ -1274,7 +1274,7 @@ async function settings(db) {
 }
 function exchangeRate(settings2, code) {
   const rate = settings2.marketRates[code];
-  if (!Number.isFinite(rate) || rate <= 0 || rate > 1e3) return error(409, "RATE_NOT_CONFIGURED", `Exchange rate for ${code} requires operator confirmation.`);
+  if (!Number.isFinite(rate) || rate <= 0 || rate > 1e3 || Math.round(rate * 1e4) / 1e4 !== rate) return error(409, "RATE_NOT_CONFIGURED", `Exchange rate for ${code} requires operator confirmation.`);
   return rate;
 }
 function currency2(value) {
@@ -1718,7 +1718,7 @@ var PlatformService = class {
     const current = await settings(this.db);
     const settings2 = { markupPercent: amount(body.markupPercent, 1e3), specialGoodsPercent: amount(body.specialGoodsPercent, 100), marketRates: { RUB: 0, EUR: 0, TWD: 0, CNY: 1, USD: 0 }, freightPerKg: amount(body.freightPerKg, 1e5), commissionPercent: amount(body.commissionPercent, 100), currency: currency2(body.currency), shippingRoutes: body.shippingRoutes === void 0 ? current.shippingRoutes : validateShippingRoutes(body.shippingRoutes) };
     for (const code of supportedCurrencies) {
-      if (typeof rates[code] !== "number" || !Number.isFinite(rates[code]) || rates[code] <= 0 || rates[code] > 1e3) return error(400, "INVALID_RATE", "Every supported currency requires an explicit positive rate per CNY.");
+      if (typeof rates[code] !== "number" || !Number.isFinite(rates[code]) || rates[code] <= 0 || rates[code] > 1e3 || Math.round(rates[code] * 1e4) / 1e4 !== rates[code]) return error(400, "INVALID_RATE", "\u6BCF\u4E2A\u5E01\u79CD\u90FD\u9700\u8981\u660E\u786E\u7684\u4EBA\u6C11\u5E01\u6362\u7B97\u6C47\u7387\uFF0C\u6700\u591A\u56DB\u4F4D\u5C0F\u6570\u3002");
       settings2.marketRates[code] = rates[code];
     }
     if (settings2.marketRates.CNY !== 1) return error(400, "INVALID_RATE", "\u4EBA\u6C11\u5E63\u5C0D\u4EBA\u6C11\u5E63\u532F\u7387\u5FC5\u9808\u662F1\u3002");
@@ -2809,6 +2809,9 @@ function createCasheraAdapter(env = process.env, fetcher = fetch) {
 import { createHmac as createHmac2, timingSafeEqual as timingSafeEqual4 } from "node:crypto";
 function createPaymentAdapter(env = process.env, fetcher = fetch) {
   if (env.PAYMENT_PROVIDER === "cashera") return createCasheraAdapter(env, fetcher);
+  if (!env.PAYMENT_PROVIDER && !env.STRIPE_SECRET_KEY) {
+    return createCasheraAdapter({ ...env, CASHERA_ENABLED: "false" }, fetcher);
+  }
   const mode = env.STRIPE_MODE;
   const secret = env.STRIPE_SECRET_KEY || "";
   const webhookSecret = env.STRIPE_WEBHOOK_SECRET || "";
